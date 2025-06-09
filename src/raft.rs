@@ -22,6 +22,8 @@ pub struct RaftNode {
     peers: Vec<u64>,                                // ids of other nodes
     tx_map: HashMap<u64, UnboundedSender<Message>>, // senders to peers
     rx: UnboundedReceiver<Message>,                 // receiver for incoming messages
+
+    log: Vec<String>,
 }
 
 impl RaftNode {
@@ -45,6 +47,8 @@ impl RaftNode {
             peers,
             tx_map,
             rx,
+
+            log: Vec::new(),
         }
     }
 
@@ -66,8 +70,18 @@ impl RaftNode {
                         }
                         Role::Leader => {
                             println!("Node {} sending heartbeats", self.id);
-                            // for now just wait before sending next heartbeat
-                            sleep (Duration::from_millis(50)).await;
+                            for peer_id in &self.peers {
+                                if let Some (tx) = self.tx_map.get(peer_id) {
+                                    let (resp_tx, _resp_rx) = unbounded_channel();
+                                    let _ = tx.send(Message::AppendEntries {
+                                        term: self.current_term,
+                                        leader_id: self.id,
+                                        entries: vec![],
+                                        respond_to: resp_tx
+                                    });
+                                }
+                            }                            
+                            sleep(Duration::from_millis(50)).await;
                         }
                     }
                 }
@@ -111,6 +125,39 @@ impl RaftNode {
                 if self.role == Role::Candidate && vote_granted {
                     println!("Node {} received vote from {}", self.id, voted_id);
                     // TODO: track votes and become leader if majority reached
+                }
+            }
+
+            Message::AppendEntries { term, leader_id: _, entries, respond_to } => {
+                if term >= self.current_term {
+                    self.current_term = term;
+                    self.role = Role::Follower;
+                    self.voted_for = None;
+                    self.last_heartbeat = Instant::now();
+
+                    self.log.extend(entries);
+
+                    let _ = respond_to.send(Message::AppendEntriesResponse { term: self.current_term, success: true, from_id: self.id });
+
+                } else {
+                    let _ = respond_to.send(Message::AppendEntriesResponse { term: self.current_term, success: false, from_id: self.id });
+                }
+            }
+
+            Message::AppendEntriesResponse { term, success, from_id } => {
+                if term > self.current_term {
+                    self.current_term = term;
+                    self.role = Role::Follower;
+                    self.voted_for = None;
+                    return;
+                }
+                if self.role == Role::Leader {
+                    if success {
+                        println!("Node {}: Append Entried to {} succeeded", self.id, from_id);
+                    }
+                    else {
+                        println!("Node {}: Append Entries to {} failed", self.id, from_id);
+                    }
                 }
             }
         }
@@ -178,5 +225,17 @@ pub enum Message {
         term: u64,
         vote_granted: bool,
         voted_id: u64,
+    },
+
+    AppendEntries {
+        term: u64,
+        leader_id: u64,
+        entries: Vec<String>,
+        respond_to: UnboundedSender<Message>,
+    },
+    AppendEntriesResponse {
+        term: u64,
+        success: bool,
+        from_id: u64,
     },
 }
