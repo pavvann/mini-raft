@@ -1,5 +1,5 @@
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::time::sleep;
@@ -23,7 +23,12 @@ pub struct RaftNode {
     tx_map: HashMap<u64, UnboundedSender<Message>>, // senders to peers
     rx: UnboundedReceiver<Message>,                 // receiver for incoming messages
 
-    log: Vec<String>,
+    log: Vec<(u64, String)>, //(term, entry)
+    commit_index: usize,
+
+    // leader only
+    next_index: HashMap<u64, usize>,
+    match_index: HashMap<u64, usize>,
 }
 
 impl RaftNode {
@@ -48,44 +53,57 @@ impl RaftNode {
             tx_map,
             rx,
 
-            log: Vec::new(),
+            log: vec![],
+            commit_index: 0,
+            next_index: HashMap::new(),
+            match_index: HashMap::new(),
         }
     }
 
     pub async fn run(&mut self) {
         loop {
             tokio::select! {
-                Some(msg) = self.rx.recv() => {
-                    self.handle_message(msg).await;
-                } _ = sleep(Duration::from_millis(100)) => {
-                    match self.role {
-                        Role::Follower | Role::Candidate => {
-                            let elapsed = self.last_heartbeat.elapsed();
-                            if elapsed >= self.election_timeout {
-                                println!("Node {} election timeout expired", self.id);
-                                self.start_election().await;
-                            } else {
-                                sleep(self.election_timeout - elapsed).await;
+                            Some(msg) = self.rx.recv() => {
+                                self.handle_message(msg).await;
+                            } _ = sleep(Duration::from_millis(100)) => {
+                                match self.role {
+                                    Role::Follower | Role::Candidate => {
+                                        let elapsed = self.last_heartbeat.elapsed();
+                                        if elapsed >= self.election_timeout {
+                                            println!("Node {} election timeout expired", self.id);
+                                            self.start_election().await;
+                                        } else {
+                                            sleep(self.election_timeout - elapsed).await;
+                                        }
+                                    }
+                                    Role::Leader => {
+
+                                        println!("Node {} sending heartbeats", self.id);
+                                        for peer_id in &self.peers {
+                                            if let Some (tx) = self.tx_map.get(peer_id) {
+                                                let (resp_tx, _resp_rx) = unbounded_channel();
+                                                let prev_log_index = self.next_index.get(peer_id).copied().unwrap_or(0).saturating_sub(1);
+                                                let prev_log_term = self
+                                                    .log
+                                                    .get(prev_log_index)
+                                                    .map(|(term, _)| *term)
+                                                    .unwrap_or(0);
+                                                let _ = tx.send(Message::AppendEntries {
+                                                    term: self.current_term,
+                                                    leader_id: self.id,
+                                                    prev_log_index: prev_log_index,
+                                                    prev_log_term: prev_log_term as u64,
+                                                    entries: vec![],
+                                                    leader_commit: self.commit_index,
+                                                    respond_to: resp_tx
+                                                });
+                                            }
+                                        }
+                                        sleep(Duration::from_millis(50)).await;
+                                    }
+                                }
                             }
                         }
-                        Role::Leader => {
-                            println!("Node {} sending heartbeats", self.id);
-                            for peer_id in &self.peers {
-                                if let Some (tx) = self.tx_map.get(peer_id) {
-                                    let (resp_tx, _resp_rx) = unbounded_channel();
-                                    let _ = tx.send(Message::AppendEntries {
-                                        term: self.current_term,
-                                        leader_id: self.id,
-                                        entries: vec![],
-                                        respond_to: resp_tx
-                                    });
-                                }
-                            }                            
-                            sleep(Duration::from_millis(50)).await;
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -112,9 +130,17 @@ impl RaftNode {
                 };
 
                 //  reply with vote decision
-                let _ = respond_to.send(Message::RequestVoteResponse { term: self.current_term, vote_granted: vote_granted, voted_id: self.id });
+                let _ = respond_to.send(Message::RequestVoteResponse {
+                    term: self.current_term,
+                    vote_granted: vote_granted,
+                    voted_id: self.id,
+                });
             }
-            Message::RequestVoteResponse { term, vote_granted, voted_id } => {
+            Message::RequestVoteResponse {
+                term,
+                vote_granted,
+                voted_id,
+            } => {
                 if term > self.current_term {
                     self.current_term = term;
                     self.role = Role::Follower;
@@ -128,23 +154,79 @@ impl RaftNode {
                 }
             }
 
-            Message::AppendEntries { term, leader_id: _, entries, respond_to } => {
-                if term >= self.current_term {
-                    self.current_term = term;
-                    self.role = Role::Follower;
-                    self.voted_for = None;
-                    self.last_heartbeat = Instant::now();
-
-                    self.log.extend(entries);
-
-                    let _ = respond_to.send(Message::AppendEntriesResponse { term: self.current_term, success: true, from_id: self.id });
-
-                } else {
-                    let _ = respond_to.send(Message::AppendEntriesResponse { term: self.current_term, success: false, from_id: self.id });
+            Message::AppendEntries {
+                term,
+                leader_id: _,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+                respond_to,
+            } => {
+                if term < self.current_term {
+                    let _ = respond_to.send(Message::AppendEntriesResponse {
+                        term: self.current_term,
+                        success: false,
+                        from_id: self.id,
+                    });
+                    return;
                 }
+
+                self.current_term = term;
+                self.role = Role::Follower;
+                self.voted_for = None;
+                self.last_heartbeat = Instant::now();
+
+                // check if log contains entry at prev log index with matching term
+                if prev_log_index > 0 {
+                    if self.log.len() < prev_log_index
+                        || self.log[prev_log_index - 1].0 != prev_log_term as u64
+                    {
+                        let _ = respond_to.send(Message::AppendEntriesResponse {
+                            term: self.current_term,
+                            success: false,
+                            from_id: self.id,
+                        });
+                        return;
+                    }
+                }
+
+                // append any new entries not already in the log
+                let mut i = 0;
+                while i < entries.len() {
+                    let index = prev_log_index + i;
+                    if index < self.log.len() {
+                        if self.log[index].1 != entries[i] {
+                            self.log.truncate(index);
+                            self.log.push((term, entries[i].clone()));
+                        }
+                    } else {
+                        self.log.push((term, entries[i].clone()));
+                    }
+                    i += 1;
+                }
+
+                // update commit index
+                if leader_commit > self.commit_index {
+                    self.commit_index = std::cmp::min(leader_commit, self.log.len());
+                    println!(
+                        "Node {} updated commit index to {}",
+                        self.id, self.commit_index
+                    );
+                }
+
+                let _ = respond_to.send(Message::AppendEntriesResponse {
+                    term: self.current_term,
+                    success: true,
+                    from_id: self.id,
+                });
             }
 
-            Message::AppendEntriesResponse { term, success, from_id } => {
+            Message::AppendEntriesResponse {
+                term,
+                success,
+                from_id,
+            } => {
                 if term > self.current_term {
                     self.current_term = term;
                     self.role = Role::Follower;
@@ -154,9 +236,16 @@ impl RaftNode {
                 if self.role == Role::Leader {
                     if success {
                         println!("Node {}: Append Entried to {} succeeded", self.id, from_id);
-                    }
-                    else {
+                        let sent_index = self.next_index.get(&from_id).copied().unwrap_or(0);
+                        self.match_index.insert(from_id, sent_index);
+                        self.next_index.insert(from_id, sent_index + 1);
+                    } else {
                         println!("Node {}: Append Entries to {} failed", self.id, from_id);
+                        self.next_index.entry(from_id).and_modify(|i| {
+                            if *i > 0 {
+                                *i -= 1;
+                            }
+                        });
                     }
                 }
             }
@@ -164,7 +253,11 @@ impl RaftNode {
     }
 
     async fn start_election(&mut self) {
-        println!("🚀 Node {} starting election for term {}", self.id, self.current_term + 1);
+        println!(
+            "🚀 Node {} starting election for term {}",
+            self.id,
+            self.current_term + 1
+        );
         self.role = Role::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id);
@@ -181,19 +274,24 @@ impl RaftNode {
         for peer_id in &self.peers {
             if let Some(tx) = self.tx_map.get(peer_id) {
                 let (resp_tx, mut resp_rx) = unbounded_channel();
-                let _ = tx.send(Message::RequestVote { term: self.current_term, candidate_id: self.id, respond_to: resp_tx });
+                let _ = tx.send(Message::RequestVote {
+                    term: self.current_term,
+                    candidate_id: self.id,
+                    respond_to: resp_tx,
+                });
 
                 // await single response with timeout
-                if let Ok(Some(Message::RequestVoteResponse {vote_granted, ..})) = 
-                    tokio::time::timeout(Duration::from_millis(200), resp_rx.recv()).await {
-                        if vote_granted {
-                            votes += 1;
-                            if votes >= majority {
-                                self.become_leader();
-                                break;
-                            }
+                if let Ok(Some(Message::RequestVoteResponse { vote_granted, .. })) =
+                    tokio::time::timeout(Duration::from_millis(200), resp_rx.recv()).await
+                {
+                    if vote_granted {
+                        votes += 1;
+                        if votes >= majority {
+                            self.become_leader();
+                            break;
                         }
                     }
+                }
             }
         }
 
@@ -211,6 +309,38 @@ impl RaftNode {
             "Node {} is now the leader for term {}",
             self.id, self.current_term
         );
+        let last_log_index = self.log.len();
+
+        self.next_index = self.peers.iter().map(|&p| (p, last_log_index)).collect();
+        self.match_index = self.peers.iter().map(|&p| (p, 0)).collect();
+
+        self.send_heartbeats();
+    }
+
+    fn send_heartbeats(&self) {
+        for &peer_id in &self.peers {
+            if let Some(tx) = self.tx_map.get(&peer_id) {
+                let prev_log_index = self
+                    .next_index
+                    .get(&peer_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(1);
+                let prev_log_term = self.log.get(prev_log_index).map(|(t, _)| *t).unwrap_or(0);
+
+                let entries = vec![];
+
+                let _ = tx.send(Message::AppendEntries {
+                    term: self.current_term,
+                    leader_id: self.id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit: self.commit_index,
+                    respond_to: self.tx_map[&self.id].clone(),
+                });
+            }
+        }
     }
 }
 
@@ -230,7 +360,10 @@ pub enum Message {
     AppendEntries {
         term: u64,
         leader_id: u64,
+        prev_log_index: usize,
+        prev_log_term: u64,
         entries: Vec<String>,
+        leader_commit: usize,
         respond_to: UnboundedSender<Message>,
     },
     AppendEntriesResponse {
