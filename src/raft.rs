@@ -29,6 +29,10 @@ pub struct RaftNode {
     // leader only
     next_index: HashMap<u64, usize>,
     match_index: HashMap<u64, usize>,
+
+    state_machine: HashMap<String, String>, // simple key value stores
+    last_applied: usize,
+
 }
 
 impl RaftNode {
@@ -57,6 +61,9 @@ impl RaftNode {
             commit_index: 0,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
+
+            state_machine: HashMap::new(),
+            last_applied: 0,
         }
     }
 
@@ -209,6 +216,7 @@ impl RaftNode {
                 // update commit index
                 if leader_commit > self.commit_index {
                     self.commit_index = std::cmp::min(leader_commit, self.log.len());
+                    self.apply_committed_entries();
                     println!(
                         "Node {} updated commit index to {}",
                         self.id, self.commit_index
@@ -362,6 +370,20 @@ impl RaftNode {
         }
     }
     
+    fn apply_committed_entries(&mut self) {
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1;
+            let (term, entry) = &self.log[self.last_applied - 1];
+
+            println!("Node {} applying log [{}] to state machine: {:?}", self.id, self.last_applied - 1, entry);
+
+
+            // for now we will assume entries are in the form "key = val"
+            if let Some((key, value)) = entry.split_once('=') {
+                self.state_machine.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
 
 }
 
