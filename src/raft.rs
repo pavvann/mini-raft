@@ -239,6 +239,8 @@ impl RaftNode {
                         let sent_index = self.next_index.get(&from_id).copied().unwrap_or(0);
                         self.match_index.insert(from_id, sent_index);
                         self.next_index.insert(from_id, sent_index + 1);
+
+                        self.update_commit_index();
                     } else {
                         println!("Node {}: Append Entries to {} failed", self.id, from_id);
                         self.next_index.entry(from_id).and_modify(|i| {
@@ -342,6 +344,25 @@ impl RaftNode {
             }
         }
     }
+
+    fn update_commit_index(&mut self) {
+        let mut match_indexes: Vec<usize> = self.match_index.values().cloned().collect();
+        match_indexes.push(self.log.len()); // include leader itself
+        match_indexes.sort_unstable_by(|a,b| b.cmp(a)); // sort desc
+
+        let majority_index = match_indexes[(self.peers.len()) / 2]; // majority threshold
+
+        if majority_index > self.commit_index {
+            if let Some((term, _)) = self.log.get(majority_index -1 ) {
+                if *term == self.current_term {
+                    self.commit_index = majority_index;
+                    println!("Node {} updated commit_index to {}", self.id, self.commit_index);
+                }
+            }
+        }
+    }
+    
+
 }
 
 #[derive(Debug)]
