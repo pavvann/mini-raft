@@ -32,7 +32,6 @@ pub struct RaftNode {
 
     state_machine: HashMap<String, String>, // simple key value stores
     last_applied: usize,
-
 }
 
 impl RaftNode {
@@ -70,47 +69,47 @@ impl RaftNode {
     pub async fn run(&mut self) {
         loop {
             tokio::select! {
-                            Some(msg) = self.rx.recv() => {
-                                self.handle_message(msg).await;
-                            } _ = sleep(Duration::from_millis(100)) => {
-                                match self.role {
-                                    Role::Follower | Role::Candidate => {
-                                        let elapsed = self.last_heartbeat.elapsed();
-                                        if elapsed >= self.election_timeout {
-                                            println!("Node {} election timeout expired", self.id);
-                                            self.start_election().await;
-                                        } else {
-                                            sleep(self.election_timeout - elapsed).await;
-                                        }
-                                    }
-                                    Role::Leader => {
-
-                                        println!("Node {} sending heartbeats", self.id);
-                                        for peer_id in &self.peers {
-                                            if let Some (tx) = self.tx_map.get(peer_id) {
-                                                let (resp_tx, _resp_rx) = unbounded_channel();
-                                                let prev_log_index = self.next_index.get(peer_id).copied().unwrap_or(0).saturating_sub(1);
-                                                let prev_log_term = self
-                                                    .log
-                                                    .get(prev_log_index)
-                                                    .map(|(term, _)| *term)
-                                                    .unwrap_or(0);
-                                                let _ = tx.send(Message::AppendEntries {
-                                                    term: self.current_term,
-                                                    leader_id: self.id,
-                                                    prev_log_index: prev_log_index,
-                                                    prev_log_term: prev_log_term as u64,
-                                                    entries: vec![],
-                                                    leader_commit: self.commit_index,
-                                                    respond_to: resp_tx
-                                                });
-                                            }
-                                        }
-                                        sleep(Duration::from_millis(50)).await;
-                                    }
-                                }
+                Some(msg) = self.rx.recv() => {
+                    self.handle_message(msg).await;
+                } _ = sleep(Duration::from_millis(100)) => {
+                    match self.role {
+                        Role::Follower | Role::Candidate => {
+                            let elapsed = self.last_heartbeat.elapsed();
+                            if elapsed >= self.election_timeout {
+                                println!("Node {} election timeout expired", self.id);
+                                self.start_election().await;
+                            } else {
+                                sleep(self.election_timeout - elapsed).await;
                             }
                         }
+                        Role::Leader => {
+
+                            println!("Node {} sending heartbeats", self.id);
+                            for peer_id in &self.peers {
+                                if let Some (tx) = self.tx_map.get(peer_id) {
+                                    let (resp_tx, _resp_rx) = unbounded_channel();
+                                    let prev_log_index = self.next_index.get(peer_id).copied().unwrap_or(0).saturating_sub(1);
+                                    let prev_log_term = self
+                                        .log
+                                        .get(prev_log_index)
+                                        .map(|(term, _)| *term)
+                                        .unwrap_or(0);
+                                    let _ = tx.send(Message::AppendEntries {
+                                        term: self.current_term,
+                                        leader_id: self.id,
+                                        prev_log_index: prev_log_index,
+                                        prev_log_term: prev_log_term as u64,
+                                        entries: vec![],
+                                        leader_commit: self.commit_index,
+                                        respond_to: resp_tx
+                                    });
+                                }
+                            }
+                            sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -259,6 +258,55 @@ impl RaftNode {
                     }
                 }
             }
+
+            Message::ClientRequest { command } => {
+                if self.role != Role::Leader {
+                    println!("Node {} rejected client request (not leader)", self.id);
+                    return;
+                }
+
+                println!("Node {} received client command: {}", self.id, command);
+
+                // append command to own log
+                self.log.push((self.current_term, command.clone()));
+
+                // update own match_index and next_index
+                let last_index = self.log.len();
+                self.match_index.insert(self.id, last_index);
+                self.next_index.insert(self.id, last_index + 1);
+
+                // send appendentries with the new entry to all peers
+                for &peer_id in &self.peers {
+                    if let Some(tx) = self.tx_map.get(&peer_id) {
+                        let prev_log_index = self
+                            .next_index
+                            .get(&peer_id)
+                            .copied()
+                            .unwrap_or(1)
+                            .saturating_sub(1);
+
+                        let prev_log_term = self
+                            .log
+                            .get(prev_log_index)
+                            .map(|(term, _)| *term)
+                            .unwrap_or(0);
+
+                        let entries = vec![command.clone()];
+
+                        let (resp_tx, _resp_rx) = unbounded_channel();
+
+                        let _ = tx.send(Message::AppendEntries {
+                            term: self.current_term,
+                            leader_id: self.id,
+                            prev_log_index,
+                            prev_log_term,
+                            entries,
+                            leader_commit: self.commit_index,
+                            respond_to: resp_tx,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -356,35 +404,43 @@ impl RaftNode {
     fn update_commit_index(&mut self) {
         let mut match_indexes: Vec<usize> = self.match_index.values().cloned().collect();
         match_indexes.push(self.log.len()); // include leader itself
-        match_indexes.sort_unstable_by(|a,b| b.cmp(a)); // sort desc
+        match_indexes.sort_unstable_by(|a, b| b.cmp(a)); // sort desc
 
         let majority_index = match_indexes[(self.peers.len()) / 2]; // majority threshold
 
         if majority_index > self.commit_index {
-            if let Some((term, _)) = self.log.get(majority_index -1 ) {
+            if let Some((term, _)) = self.log.get(majority_index - 1) {
                 if *term == self.current_term {
                     self.commit_index = majority_index;
-                    println!("Node {} updated commit_index to {}", self.id, self.commit_index);
+                    println!(
+                        "Node {} updated commit_index to {}",
+                        self.id, self.commit_index
+                    );
+                    self.apply_committed_entries();
                 }
             }
         }
     }
-    
+
     fn apply_committed_entries(&mut self) {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let (term, entry) = &self.log[self.last_applied - 1];
 
-            println!("Node {} applying log [{}] to state machine: {:?}", self.id, self.last_applied - 1, entry);
-
+            println!(
+                "Node {} applying log [{}] to state machine: {:?}",
+                self.id,
+                self.last_applied - 1,
+                entry
+            );
 
             // for now we will assume entries are in the form "key = val"
             if let Some((key, value)) = entry.split_once('=') {
-                self.state_machine.insert(key.to_string(), value.to_string());
+                self.state_machine
+                    .insert(key.to_string(), value.to_string());
             }
         }
     }
-
 }
 
 #[derive(Debug)]
@@ -413,5 +469,9 @@ pub enum Message {
         term: u64,
         success: bool,
         from_id: u64,
+    },
+
+    ClientRequest {
+        command: String,
     },
 }

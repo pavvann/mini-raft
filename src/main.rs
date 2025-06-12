@@ -1,8 +1,10 @@
 mod raft;
-use std::{collections::HashMap};
+use std::{collections::HashMap, time::Duration};
 
 use raft::{Message, RaftNode};
 use tokio::{sync::mpsc::unbounded_channel, task};
+use tokio::time::sleep;
+
 
 #[tokio::main]
 async fn main() {
@@ -31,6 +33,14 @@ async fn main() {
     // sleep forever to keep main alive
     println!("🔧 Spinning up Raft cluster...");
 
+    let tx_map_clone = tx_map.clone();
+    tokio::spawn(async move {
+      sleep(Duration::from_secs(5)).await;
+      let leader_id = 3;
+      if let Some(tx) = tx_map_clone.get(&leader_id) {
+        let _ = tx.send(Message::ClientRequest { command: "x = 42".to_string() });
+      }  
+    });
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
     }
